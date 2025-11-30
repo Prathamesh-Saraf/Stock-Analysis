@@ -297,14 +297,87 @@ def build_parameter_table(ticker, summary, factors, iv_value):
         rows.append(("MACD hist", f"{macd:.4f}", macd_comment))
     else:
         rows.append(("MACD hist", "N/A", "Insufficient data"))
-    # Volume
-    vol_today = summary.get("vol_today"); vol20 = summary.get("vol20")
+    # # Volume (robust, safe formatting)
+    # vol_today = summary.get("vol_today")
+    # vol20 = summary.get("vol20")
+    # vol_today_str = f"{int(vol_today):,}" if vol_today is not None else "N/A"
+    # vol20_str = f"{int(vol20):,}" if vol20 is not None else "N/A"
+    # vol_comment = "Above avg" if factors.get("Vol_OK") else "Not above avg"
+    # val_vol = f"{vol_today_str} / {vol20_str}"
+    # if vol_today is None or vol20 is None:
+    #     vol_verdict = "Insufficient data"
+    # else:
+    #     try:
+    #         pct = (vol_today / vol20 - 1.0) * 100.0
+    #         vol_verdict = f"{pct:+.1f}% vs 20d"
+    #     except Exception:
+    #         vol_verdict = "N/A"
+    # rows.append(("Volume (today) / 20d avg", val_vol, f"{vol_comment} ({vol_verdict})"))
+
+    # Volume (robust, safe formatting) with rating and action guidance
+    vol_today = summary.get("vol_today")
+    vol20 = summary.get("vol20")
+
+    # Human-readable numbers
     vol_today_str = f"{int(vol_today):,}" if vol_today is not None else "N/A"
     vol20_str = f"{int(vol20):,}" if vol20 is not None else "N/A"
+    val_vol = f"{vol_today_str} / {vol20_str}"
+
+    # Basic existing comment (preserve your earlier logic if present)
     vol_comment = "Above avg" if factors.get("Vol_OK") else "Not above avg"
-    rows.append(("Volume (today)", vol_today_str, "Daily traded volume"))
-    rows.append(("Volume 20d avg", vol20_str, "20-day average"))
-    rows.append(("Volume verdict", vol_comment, "Participation check"))
+
+    # Compute percent difference and ratio safely
+    if vol_today is None or vol20 is None or vol20 == 0:
+        vol_verdict = "Insufficient data"
+        vol_ratio = None
+    else:
+        try:
+            ratio = float(vol_today) / float(vol20)
+            pct = (ratio - 1.0) * 100.0
+            vol_ratio = ratio
+            vol_verdict = f"{pct:+.1f}% vs 20d"
+        except Exception:
+            vol_ratio = None
+            vol_verdict = "N/A"
+
+    # Volume rating buckets (use ratio where available)
+    # Thresholds:
+    #   ratio > 2.0   -> Explosive (Very strong confirmation)
+    #   1.5 - 2.0     -> Strong (Good confirmation)
+    #   1.0 - 1.5     -> Acceptable (OK confirmation)
+    #   0.7 - 1.0     -> Neutral (Caution)
+    #   0.4 - 0.7     -> Weak (Avoid breakouts)
+    #   < 0.4         -> Very weak (Ignore moves)
+    if vol_ratio is None:
+        vol_rating = "Insufficient data"
+        vol_action = "N/A"
+    else:
+        if vol_ratio > 2.0:
+            vol_rating = "Explosive"
+            vol_action = "Very strong confirmation — good for momentum trades."
+        elif vol_ratio > 1.5:
+            vol_rating = "Strong"
+            vol_action = "Good confirmation — consider trading with trend."
+        elif vol_ratio > 1.0:
+            vol_rating = "Above normal"
+            vol_action = "Acceptable confirmation — proceed with caution."
+        elif vol_ratio >= 0.7:
+            vol_rating = "Neutral"
+            vol_action = "Weak confirmation — avoid high-risk entries."
+        elif vol_ratio >= 0.4:
+            vol_rating = "Weak"
+            vol_action = "Not reliable — avoid breakout trades."
+        else:
+            vol_rating = "Very weak"
+            vol_action = "Ignore signals — likely noise or low participation."
+
+    # Compose final comment (keeps your vol_comment and adds rating & action)
+    vol_summary = f"{vol_comment} ({vol_verdict}) — {vol_rating}; {vol_action}"
+
+    # Append to rows (same structure you used)
+    rows.append(("Volume (today) / 20d avg", val_vol, vol_summary))
+
+
     # Analyst
     rec_mean = summary.get("rec_mean"); a_count = summary.get("analyst_count")
     if rec_mean is not None:
@@ -332,7 +405,7 @@ def build_parameter_table(ticker, summary, factors, iv_value):
 
 # ---------------- App UI ----------------
 st.title("Multi-Stock Dashboard — Clear Table Verdicts")
-st.write("Enter comma-separated tickers. The table shows Parameter | Value | Comment/Verdict for each symbol.")
+st.write("Enter comma-separated Stock names. Use this analysis with a grain of salt")
 
 with st.sidebar:
     st.header("Settings")
