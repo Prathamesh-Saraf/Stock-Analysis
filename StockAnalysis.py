@@ -1,11 +1,7 @@
 # app.py
 """
-Streamlit dashboard (updated):
- - removes allocation output
- - prints VIX once
- - shows per-stock Implied Volatility (IV) computed from nearest option expiry (best-effort)
- - displays per-stock parameters in a structured Parameter|Value|Comment table
- - supports ETFs (technical analysis applies; analyst/IV may be missing)
+Streamlit dashboard — parameter table with explicit Comment/Verdict.
+Removes allocation output and VIX/ETF rows from parameter table.
 """
 
 import io
@@ -29,7 +25,7 @@ VIX_THRESHOLD = 25.0
 DEFAULT_PERIOD = "2y"
 BATCH_SIZE = 8
 
-st.set_page_config(layout="wide", page_title="Multi-Stock Dashboard (IV & Table)", initial_sidebar_state="expanded")
+st.set_page_config(layout="wide", page_title="Multi-Stock Dashboard (Table verdicts)", initial_sidebar_state="expanded")
 
 # ---------------- Utility ----------------
 def safe_float_last(x):
@@ -60,7 +56,7 @@ def compute_indicators(df):
     rs = avg_gain / avg_loss.replace(0, np.nan)
     df["RSI"] = 100 - (100 / (1 + rs))
     df["RSI"] = df["RSI"].fillna(50)
-    # MACD
+    # MACD hist
     ema_fast = df["Close"].ewm(span=MACD_FAST, adjust=False).mean()
     ema_slow = df["Close"].ewm(span=MACD_SLOW, adjust=False).mean()
     macd = ema_fast - ema_slow
@@ -122,7 +118,6 @@ def fetch_analyst_data(ticker):
     target_mean = None
     try:
         t = yf.Ticker(ticker)
-        # try earnings_trend
         try:
             trend = getattr(t, "earnings_trend", None)
             if trend and isinstance(trend, dict) and "trend" in trend and len(trend["trend"])>0:
@@ -132,7 +127,6 @@ def fetch_analyst_data(ticker):
                 target_mean = curr.get("targetMean") or curr.get("targetmean")
         except Exception:
             pass
-        # fallback get_earnings_trend
         if rec_mean is None or analyst_count is None:
             try:
                 if hasattr(t, "get_earnings_trend"):
@@ -144,7 +138,6 @@ def fetch_analyst_data(ticker):
                         target_mean = target_mean or curr.get("targetMean")
             except Exception:
                 pass
-        # fallback to info
         try:
             info = t.get_info() if hasattr(t, "get_info") else getattr(t, "info", {}) or {}
             if rec_mean is None:
@@ -153,7 +146,6 @@ def fetch_analyst_data(ticker):
                 target_mean = info.get("targetMeanPrice") or info.get("targetMean")
         except Exception:
             pass
-        # recommendations table count fallback
         try:
             recs = t.recommendations
             if isinstance(recs, pd.DataFrame) and not recs.empty:
@@ -180,16 +172,11 @@ def fetch_analyst_data(ticker):
 # ---------------- Implied Volatility (IV) ----------------
 @st.cache_data(ttl=300)
 def fetch_implied_volatility(ticker):
-    """
-    Best-effort IV: take nearest option expiry (>=7 days away), compute mean impliedVolatility
-    across calls+puts. Returns IV as percentage (e.g., 25.4) or None.
-    """
     try:
         t = yf.Ticker(ticker)
         exps = t.options
         if not exps:
             return None
-        # select nearest expiry >= 7 days out (to avoid weekly noise); fallback to first
         today = datetime.utcnow().date()
         chosen = None
         for e in exps:
@@ -213,7 +200,6 @@ def fetch_implied_volatility(ticker):
                 ivs += list(puts["impliedVolatility"].dropna().astype(float))
             if not ivs:
                 return None
-            # yfinance impliedVolatility is between 0-1; convert to percent
             mean_iv = float(np.mean(ivs)) * 100.0
             return mean_iv
         except Exception:
@@ -221,7 +207,7 @@ def fetch_implied_volatility(ticker):
     except Exception:
         return None
 
-# ---------------- Factors & scoring (same logic) ----------------
+# ---------------- Factors & scoring ----------------
 def compute_factors(summary, vix_value, vix_threshold=VIX_THRESHOLD):
     factors = {}
     factors["Trend_OK"] = (summary.get("sma50") is not None and summary.get("sma200") is not None and summary["sma50"] > summary["sma200"])
@@ -275,39 +261,78 @@ def render_plot(df, ticker):
     fig.tight_layout()
     return fig
 
-def build_parameter_table(ticker, summary, factors, iv_value, is_etf):
-    # rows: Parameter, Value, Comment/Verdict
+def build_parameter_table(ticker, summary, factors, iv_value):
     rows = []
     cur = summary.get("current")
+    # Price
     rows.append(("Price", f"${cur:.2f}" if cur is not None else "N/A", "Latest close"))
+    # SMA50/200 and verdict
     s50 = summary.get("sma50"); s200 = summary.get("sma200")
     if s50 is not None and s200 is not None:
-        rows.append((f"SMA{SMA_SHORT}/{SMA_LONG}", f"{s50:.2f} / {s200:.2f}", "Trend structure"))
-        rows.append(("Trend", "UP" if factors.get("Trend_OK") else "DOWN", "SMA50 > SMA200?" ))
+        val = f"{s50:.2f} / {s200:.2f}"
+        verdict = "UP trend" if s50 > s200 else "DOWN trend"
+        rows.append((f"SMA{SMA_SHORT}/{SMA_LONG}", val, verdict))
     else:
-        rows.append(("SMA", "N/A", "Insufficient data"))
+        rows.append((f"SMA{SMA_SHORT}/{SMA_LONG}", "N/A", "Insufficient data"))
+    # RSI
     rsi = summary.get("rsi")
-    rows.append(("RSI(14)", f"{rsi:.1f}" if rsi is not None else "N/A", "45-65 = healthy momentum" if rsi is not None else "N/A"))
+    if rsi is not None:
+        if rsi < 30:
+            rsi_comment = "Oversold"
+        elif rsi <= 45:
+            rsi_comment = "Weak"
+        elif rsi <= 65:
+            rsi_comment = "Healthy momentum"
+        elif rsi <= 75:
+            rsi_comment = "Overbought"
+        else:
+            rsi_comment = "Strongly overbought"
+        rows.append(("RSI(14)", f"{rsi:.1f}", rsi_comment))
+    else:
+        rows.append(("RSI(14)", "N/A", "Insufficient data"))
+    # MACD hist
     macd = summary.get("macd_hist")
-    rows.append(("MACD hist", f"{macd:.4f}" if macd is not None else "N/A", "Positive = bullish momentum"))
+    if macd is not None:
+        macd_comment = "Bullish" if macd > 0 else "Bearish"
+        rows.append(("MACD hist", f"{macd:.4f}", macd_comment))
+    else:
+        rows.append(("MACD hist", "N/A", "Insufficient data"))
+    # Volume
     vol_today = summary.get("vol_today"); vol20 = summary.get("vol20")
-    rows.append(("Volume (today)", f"{int(vol_today):,}" if vol_today is not None else "N/A", "Daily volume"))
-    rows.append(("Volume 20d avg", f"{int(vol20):,}" if vol20 is not None else "N/A", "20-day average"))
-    rows.append(("Volume verdict", "Above avg" if factors.get("Vol_OK") else "Not above avg", "Participation check"))
+    vol_today_str = f"{int(vol_today):,}" if vol_today is not None else "N/A"
+    vol20_str = f"{int(vol20):,}" if vol20 is not None else "N/A"
+    vol_comment = "Above avg" if factors.get("Vol_OK") else "Not above avg"
+    rows.append(("Volume (today)", vol_today_str, "Daily traded volume"))
+    rows.append(("Volume 20d avg", vol20_str, "20-day average"))
+    rows.append(("Volume verdict", vol_comment, "Participation check"))
+    # Analyst
     rec_mean = summary.get("rec_mean"); a_count = summary.get("analyst_count")
-    rows.append(("Analyst rec (mean)", f"{rec_mean:.2f}" if rec_mean is not None else "N/A", f"{a_count if a_count is not None else 'N/A'} analysts"))
-    rows.append(("Target mean", f"${summary['target_mean']:.2f}" if summary.get("target_mean") is not None else "N/A", "Mean analyst target"))
-    rows.append(("Implied Vol (IV)", f"{iv_value:.1f}% " if iv_value is not None else "N/A", "Avg IV from nearest expiry (calls+puts)"))
-    rows.append(("VIX (market)", f"{summary.get('vix'):.2f}" if summary.get("vix") is not None else "N/A", f"Global market volatility; used for sentiment threshold {VIX_THRESHOLD}"))
-    rows.append(("ETF?", "Yes" if is_etf else "No", "Detected from yfinance quoteType (if available)"))
-    rows.append(("Positive factors", f"{summary.get('positives')} / 6", "Count of satisfied checks"))
+    if rec_mean is not None:
+        analyst_comment = "Bullish" if (rec_mean <= 2.5 and (a_count is not None and a_count >= 10)) else ("Weak" if rec_mean > 3.5 else "Mixed")
+        rows.append(("Analyst rec (mean)", f"{rec_mean:.2f}", analyst_comment + (f" ({a_count} analysts)" if a_count is not None else "")))
+    else:
+        rows.append(("Analyst rec (mean)", "N/A", "No analyst data"))
+    # Target mean
+    tgt = summary.get("target_mean")
+    if tgt is not None and cur is not None:
+        upside = (tgt/cur - 1) * 100.0
+        rows.append(("Target mean", f"${tgt:.2f}", f"Upside {upside:.1f}%"))
+    else:
+        rows.append(("Target mean", "N/A", "No target available"))
+    # Implied Vol
+    if iv_value is not None:
+        rows.append(("Implied Vol (IV)", f"{iv_value:.1f}%", "Mean IV from nearest expiry"))
+    else:
+        rows.append(("Implied Vol (IV)", "N/A", "Options data not available"))
+    # Positive factors & recommendation
+    rows.append(("Positive factors", f"{summary.get('positives')} / 6", "Count of passed checks"))
     rows.append(("Recommendation", summary.get("recommendation"), summary.get("reason")))
     df_table = pd.DataFrame(rows, columns=["Parameter", "Value", "Comment/Verdict"])
     return df_table
 
 # ---------------- App UI ----------------
-st.title("Multi-Stock Dashboard — IV, Indicators & Table")
-st.write("Enter tickers (comma-separated). The dashboard prints VIX once, shows IV per symbol (best-effort), and a structured parameter table.")
+st.title("Multi-Stock Dashboard — Clear Table Verdicts")
+st.write("Enter comma-separated tickers. The table shows Parameter | Value | Comment/Verdict for each symbol.")
 
 with st.sidebar:
     st.header("Settings")
@@ -322,7 +347,6 @@ tickers = [t.strip().upper() for t in tickers_input.split(",") if t.strip()]
 
 if run_button:
     with st.spinner("Running analysis..."):
-        # Fetch VIX once and display at top
         vix_val = fetch_vix_value()
         if vix_val is not None:
             st.metric("VIX (latest)", f"{vix_val:.2f}")
@@ -358,21 +382,10 @@ if run_button:
             summary["analyst_count"] = a_count
             summary["target_mean"] = tgt
 
-            # detect if ETF (best-effort)
-            is_etf = False
-            try:
-                info = yf.Ticker(tk).get_info()
-                if isinstance(info, dict):
-                    qt = info.get("quoteType") or info.get("quote_type")
-                    if qt and str(qt).upper() == "ETF":
-                        is_etf = True
-            except Exception:
-                is_etf = False
-
             # implied vol
             iv_val = fetch_implied_volatility(tk)
 
-            # compute factors and score
+            # compute factors and decision
             factors = compute_factors(summary, vix_val)
             positives = score_positives(summary, factors)
             rec, reason = final_recommendation(summary, factors)
@@ -384,8 +397,8 @@ if run_button:
             fig = render_plot(df, tk)
             st.pyplot(fig)
 
-            # table and text
-            table = build_parameter_table(tk, summary, factors, iv_val, is_etf)
+            # table
+            table = build_parameter_table(tk, summary, factors, iv_val)
             st.dataframe(table, use_container_width=True)
 
 else:
